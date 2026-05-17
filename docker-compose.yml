@@ -1,0 +1,132 @@
+version: "3.9"
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dispatch_os
+      POSTGRES_USER: dispatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dispatch_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatch -d dispatch_os"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://dispatch:${POSTGRES_PASSWORD:-dispatch_secret}@db:5432/dispatch_os
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - static_files:/app/staticfiles
+      - ./secrets:/app/secrets:ro
+      - media_files:/app/media
+    # Local dev: TMS=8000, Driver_Onboarding=8001, Recommender=8002, Dispatch OS=8003
+    ports:
+      - "8003:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             celery -A config worker --loglevel=info --concurrency=2 -Q celery"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://dispatch:${POSTGRES_PASSWORD:-dispatch_secret}@db:5432/dispatch_os
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./secrets:/app/secrets:ro
+      - media_files:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-send:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             celery -A config worker --loglevel=info --concurrency=2 -Q send"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://dispatch:${POSTGRES_PASSWORD:-dispatch_secret}@db:5432/dispatch_os
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./secrets:/app/secrets:ro
+      - media_files:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             celery -A config beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://dispatch:${POSTGRES_PASSWORD:-dispatch_secret}@db:5432/dispatch_os
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_files:
+  media_files:

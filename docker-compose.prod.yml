@@ -1,0 +1,121 @@
+# Production overrides for docker-compose.yml.
+# Use with:  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Required env vars (in .env):
+#   SECRET_KEY              — strong random string (64+ chars)
+#   POSTGRES_PASSWORD       — strong random string
+#   ALLOWED_HOSTS           — comma-separated, e.g. dispatch.example.com
+#   FRONTEND_URL            — https://dispatch.example.com
+#   CORS_ALLOWED_ORIGINS    — comma-separated list of frontend origins
+#   CSRF_TRUSTED_ORIGINS    — comma-separated list of frontend origins
+#   USE_HTTPS=True          — enables HSTS, secure cookies, etc.
+#   DEBUG=False
+services:
+
+  db:
+    deploy:
+      resources:
+        limits:    { cpus: "1.0", memory: 1G }
+        reservations: { cpus: "0.25", memory: 256M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "20m", max-file: "5" }
+
+  redis:
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    deploy:
+      resources:
+        limits:    { cpus: "0.5", memory: 512M }
+        reservations: { cpus: "0.1", memory: 128M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+  api:
+    # Production gunicorn: more workers, faster timeouts, access log to stdout
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application
+               --bind 0.0.0.0:8000
+               --workers 4
+               --threads 2
+               --worker-class gthread
+               --timeout 60
+               --graceful-timeout 30
+               --max-requests 1000
+               --max-requests-jitter 100
+               --access-logfile -
+               --error-logfile -"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/auth/csrf/').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:    { cpus: "2.0", memory: 1.5G }
+        reservations: { cpus: "0.5", memory: 512M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "20m", max-file: "5" }
+
+  worker:
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             celery -A config worker --loglevel=warning --concurrency=4
+               -Q celery
+               --max-tasks-per-child=200
+               --prefetch-multiplier=4"
+    healthcheck:
+      test: ["CMD", "celery", "-A", "config", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:    { cpus: "2.0", memory: 1G }
+        reservations: { cpus: "0.5", memory: 256M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "20m", max-file: "5" }
+
+  worker-send:
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             celery -A config worker --loglevel=warning --concurrency=2
+               -Q send
+               --max-tasks-per-child=100
+               --prefetch-multiplier=1"
+    deploy:
+      resources:
+        limits:    { cpus: "1.0", memory: 768M }
+        reservations: { cpus: "0.2", memory: 256M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "20m", max-file: "5" }
+
+  beat:
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             celery -A config beat --loglevel=warning
+               --scheduler django_celery_beat.schedulers:DatabaseScheduler"
+    deploy:
+      resources:
+        limits:    { cpus: "0.25", memory: 256M }
+        reservations: { cpus: "0.05", memory: 64M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+  frontend:
+    deploy:
+      resources:
+        limits:    { cpus: "0.5", memory: 256M }
+        reservations: { cpus: "0.05", memory: 32M }
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
