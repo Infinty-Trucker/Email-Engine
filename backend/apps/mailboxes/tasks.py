@@ -357,6 +357,15 @@ def ingest_from_settings(self, settings_mailbox_id, gmail_message_id):
             except Exception as cls_err:
                 logger.warning("Inline classify failed: %s", cls_err)
 
+            # Run mail-rule automations (e.g. Phoenix Capital factoring
+            # schedule auto-import). Failures here are logged but do not
+            # block ingest — the message has already been persisted.
+            try:
+                from apps.automations.dispatcher import dispatch_message
+                dispatch_message(msg)
+            except Exception as auto_err:
+                logger.warning("Automations dispatch failed: %s", auto_err)
+
     logger.info("Ingested thread %s (%d messages) for %s", thread_id, len(thread_msgs), smb.email_address)
 
 

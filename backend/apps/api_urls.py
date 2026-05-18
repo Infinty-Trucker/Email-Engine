@@ -10,4 +10,5 @@ urlpatterns = [
     path("users/",         include("apps.users.urls")),
     path("slack/",         include("apps.notifications.urls")),
     path("system/",        include("apps.core.urls")),
+    path("automations/",   include("apps.automations.urls")),
 ]
