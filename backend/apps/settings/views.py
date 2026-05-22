@@ -454,10 +454,10 @@ def sa_test(request, sa_id):
 
 @api_view(["GET"])
 def mailbox_list(request):
-    # X-Tenant from the consolidated UI scopes by mc_number so dispatchers
-    # can't enumerate every other tenant's mailboxes. Without the header
-    # (standalone DOS admin UI), fall through to the legacy unscoped list.
-    # Also defense-in-depth: TMS-authenticated requests need email.mailbox.manage.
+    # Admin endpoint: returns mailboxes across every MC so the email admin
+    # can manage them all from one screen. The selected MC in the consolidated
+    # UI header does not scope this list. Defense-in-depth: TMS-authenticated
+    # requests still need email.mailbox.manage.
     tenant_mc = (request.headers.get("X-Tenant") or "").strip()
     if tenant_mc:
         from apps.users.tms_auth import has_tms_permission
@@ -468,10 +468,7 @@ def mailbox_list(request):
             )
     mbs = MailboxSettings.objects.select_related(
         "company", "service_account", "oauth_credential"
-    )
-    if tenant_mc:
-        mbs = mbs.filter(company__mc_number=tenant_mc)
-    mbs = mbs.all()
+    ).all()
     return Response([{
         "id":              str(m.id),
         "email_address":   m.email_address,
@@ -519,6 +516,14 @@ def mailbox_create(request):
     email = request.data.get("email_address", "").strip().lower()
     if not email:
         return Response({"error": "email_address required"}, status=400)
+    existing = MailboxSettings.objects.select_related("company").filter(email_address=email).first()
+    if existing:
+        return Response({
+            "error": f"Mailbox {email} already exists under {existing.company.name} ({existing.company.mc_number}). Edit the existing mailbox instead of recreating it.",
+            "existing_id": str(existing.id),
+            "existing_company_id": str(existing.company_id),
+            "existing_company_mc": existing.company.mc_number,
+        }, status=409)
     sa_id = request.data.get("service_account_id")
     sa = GoogleServiceAccount.objects.filter(id=sa_id).first() if sa_id else None
     auth_method = request.data.get("auth_method", "oauth")
