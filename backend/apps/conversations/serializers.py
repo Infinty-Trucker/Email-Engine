@@ -62,7 +62,8 @@ class ConversationSerializer(serializers.ModelSerializer):
         model = Conversation
         fields = ["id","gmail_thread_id","company_name","company_id","mailbox_email",
                   "category","priority","status","last_message_at","read_at",
-                  "is_starred","unread","created_at",
+                  "is_starred","unread","created_at","related_load_id",
+                  "auto_monitor","last_followup_alert_at",
                   "messages","latest_classification"]
 
 
@@ -111,4 +112,5 @@ class ConversationListSerializer(serializers.ModelSerializer):
             "category", "priority", "status",
             "last_message_at", "read_at", "is_starred", "unread", "created_at",
             "preview_sender", "preview_subject", "preview_snippet",
+            "related_load_id", "auto_monitor",
         ]

@@ -1066,25 +1066,49 @@ def mailbox_sync(request, mb_id):
                     except Exception:
                         sent_at = tz.now()
 
+                    mc_number_cached = ""
+                    try:
+                        mc_number_cached = legacy_mb.company.mc_number or ""
+                    except Exception:
+                        pass
+
                     conv, created = Conversation.objects.get_or_create(
                         gmail_thread_id=t_id,
                         mailbox=legacy_mb,
-                        defaults={"status": "open", "last_message_at": sent_at},
+                        defaults={
+                            "status": "open",
+                            "last_message_at": sent_at,
+                            "mc_number": mc_number_cached,
+                        },
                     )
                     if not created and (not conv.last_message_at or sent_at > conv.last_message_at):
                         Conversation.objects.filter(id=conv.id).update(last_message_at=sent_at)
+                    if not conv.mc_number and mc_number_cached:
+                        Conversation.objects.filter(id=conv.id).update(mc_number=mc_number_cached)
+                        conv.mc_number = mc_number_cached
 
                     payload       = raw.get("payload", {})
                     body_text_raw, body_html = _extract_body(payload)
                     body_text     = _clean_body_text(body_text_raw)
                     att_meta      = _extract_attachments(payload, msg_id)
 
+                    # On outbound, recipient is the actual To: header (the
+                    # broker we wrote to), not our own mailbox. cc captures
+                    # the Cc: header so the UI can show real Cc lists. v1
+                    # collapses multi-To to the primary address.
+                    to_header = headers.get("to", "") or ""
+                    cc_header = headers.get("cc", "") or ""
+                    if direction == "outbound":
+                        primary_to = _extract_email(to_header.split(",")[0]) if to_header else mb.email_address
+                    else:
+                        primary_to = mb.email_address
                     msg_obj = Message.objects.create(
                         conversation     = conv,
                         direction        = direction,
                         gmail_message_id = msg_id,
                         sender_email     = from_email,
-                        recipient_email  = mb.email_address,
+                        recipient_email  = primary_to,
+                        cc               = cc_header,
                         subject          = subject,
                         snippet          = snippet,
                         body_text        = body_text or snippet,
@@ -1111,13 +1135,30 @@ def mailbox_sync(request, mb_id):
                     dir_label = "→ sent" if direction == "outbound" else "← recv"
                     log(f"  ✓ {dir_label} {subject[:50]} — {from_email}{att_info}", "success")
 
+                    # Fill the denormalized inbox preview from the first inbound
+                    # message we see for this thread. Without this the CARRIERS
+                    # sidebar (which groups by preview_sender's domain) sees an
+                    # empty column for every sync-ingested row.
+                    if direction == "inbound":
+                        preview_updates = {}
+                        if not conv.preview_sender and from_email:
+                            preview_updates["preview_sender"] = from_email
+                        if conv.preview_subject in (None, "", "(no subject)") and subject:
+                            preview_updates["preview_subject"] = subject
+                        if not conv.preview_snippet and snippet:
+                            preview_updates["preview_snippet"] = snippet
+                        if preview_updates:
+                            Conversation.objects.filter(id=conv.id).update(**preview_updates)
+                            for k, v in preview_updates.items():
+                                setattr(conv, k, v)
+
                     if direction == "inbound":
                         try:
                             from apps.classifier.engine import classify_fast
                             result = classify_fast(from_email, subject, body_text)
-                            conv_obj.category = result["category"]
-                            conv_obj.priority = result["priority"]
-                            conv_obj.save(update_fields=["category", "priority", "updated_at"])
+                            conv.category = result["category"]
+                            conv.priority = result["priority"]
+                            conv.save(update_fields=["category", "priority", "updated_at"])
                             from apps.classifier.models import Classification
                             Classification.objects.update_or_create(
                                 message=msg_obj,
@@ -1125,6 +1166,15 @@ def mailbox_sync(request, mb_id):
                                           "ai_summary": result["summary"], "confidence": result["confidence"],
                                           "model_version": result.get("model", "keyword")},
                             )
+                            # Dispatch AI refinement async — keyword above gives an instant
+                            # baseline; the worker overwrites with Haiku's answer when it
+                            # lands. NOISE rows are skipped to save tokens (the engine
+                            # short-circuits them too, but cheaper to never enqueue).
+                            if result.get("category") != "NOISE":
+                                try:
+                                    classify_message.delay(str(msg_obj.id))
+                                except Exception as cls_err:
+                                    logger.warning("AI classify dispatch failed: %s", cls_err)
                         except Exception:
                             pass
 

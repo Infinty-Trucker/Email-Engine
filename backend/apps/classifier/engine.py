@@ -11,32 +11,87 @@ def _get_client():
         _client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     return _client
 
-SYSTEM = """You are a freight dispatch email classifier. Respond ONLY with valid JSON.
-Categories: LOAD, DRIVER, BILLING, CLAIMS, INSURANCE, SAFETY, AUDIT, GENERAL
-Priorities: HIGH (same-day), MEDIUM (24-48h), LOW (informational)"""
+# Kept above the 1024-token cache minimum on purpose: a richer system prompt
+# both improves classification accuracy AND lets Anthropic cache it across
+# calls (90% input-token discount on cache hits — see cache_control below).
+SYSTEM = """You are a freight dispatch email classifier for a US trucking company.
+Respond ONLY with valid minified JSON — no prose, no markdown fences.
+
+Output shape (exact keys, exact casing):
+{"category":"LOAD","priority":"HIGH","summary":"max 10 words","confidence":0.9}
+
+Categories (pick the single best fit):
+- LOAD       — rate confirmations, load offers, dispatch instructions, BOLs, pickup/delivery, lumper, detention, TONU, layover, deadhead, lane, drop trailer
+- DRIVER     — driver onboarding, CDL/license, orientation, W-9/1099, employment, application, recruiting (only when from a real recruiter)
+- BILLING    — invoices, payments, factoring, quickpay, settlements, deductions, comcheck, EFS, fuel advance, remittance, accounts payable
+- CLAIMS     — cargo claims, freight claims, damage, loss, shortage
+- INSURANCE  — COI, liability, coverage, endorsement, policy, underwriting, certificate requests
+- SAFETY     — accidents, violations, drug/alcohol tests, crashes, hazmat, DOT physical, MVR, incident reports
+- AUDIT      — FMCSA audit, DOT audit, compliance review, CSA score, inspection, out-of-service
+- GENERAL    — anything that does not clearly fit above (real human follow-ups, status checks, etc.)
+
+Priorities:
+- HIGH    — same-day action required: rate cons, load offers with deadlines, audits, accidents, OOS, claims under deadline
+- MEDIUM  — 24-48h action: invoices, COI requests, driver paperwork, factoring follow-ups
+- LOW     — informational only, no action expected
+
+Tie-breakers:
+- A LOAD that needs same-day pickup/delivery is HIGH even if the sender is friendly.
+- A BILLING reminder with a due date inside 7 days is MEDIUM, not LOW.
+- Generic mass-mailers (newsletters, promotional offers, marketing blasts) should be GENERAL/LOW with low confidence — the upstream noise filter usually catches these before you see them.
+
+Summary rules:
+- ≤ 10 words, written as a directive ("Confirm pickup Tue 8am Dallas")
+- Never echo the subject verbatim
+- No quotes, no trailing punctuation"""
+
 
 def run_classification(from_email, subject, body):
     if not settings.ANTHROPIC_API_KEY:
-        return _fallback(subject)
-    prompt = f"From: {from_email}\nSubject: {subject}\nBody:\n{body[:1500]}\n\nRespond: {{\"category\":\"...\",\"priority\":\"...\",\"summary\":\"max 10 words\",\"confidence\":0.9}}"
+        return _fallback(subject, body, from_email)
+
+    # Token savings — never spend an LLM call on obvious marketing/auto-mail.
+    # `is_noise` already handles List-Unsubscribe headers, marketing keyword
+    # subjects, and noreply@-style senders.
+    if is_noise(from_email, subject, body):
+        return _fallback(subject, body, from_email)
+
+    user_prompt = (
+        f"From: {from_email}\n"
+        f"Subject: {subject}\n\n"
+        f"Body:\n{(body or '')[:600]}"
+    )
     try:
         msg = _get_client().messages.create(
-            model=settings.ANTHROPIC_MODEL, max_tokens=200, system=SYSTEM,
-            messages=[{"role":"user","content":prompt}]
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=160,
+            # System as a content block with cache_control so the (large) instructions
+            # block is cached across the inbox burst and we only pay for the per-email
+            # user turn after the first call.
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": user_prompt}],
         )
-        raw = msg.content[0].text.strip().replace("```json","").replace("```","").strip()
-        r   = json.loads(raw)
-        r["category"]   = r.get("category","GENERAL").upper()
-        r["priority"]   = r.get("priority","MEDIUM").upper()
+        raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        r = json.loads(raw)
+        r["category"]   = r.get("category", "GENERAL").upper()
+        r["priority"]   = r.get("priority", "MEDIUM").upper()
         r["summary"]    = r.get("summary", subject)[:120]
-        r["confidence"] = float(r.get("confidence",0.9))
-        r["model"]      = "claude-sonnet-4"
-        if r["category"] not in ("LOAD","DRIVER","BILLING","CLAIMS","INSURANCE","SAFETY","AUDIT","GENERAL"): r["category"] = "GENERAL"
-        if r["priority"] not in ("HIGH","MEDIUM","LOW"): r["priority"] = "MEDIUM"
+        r["confidence"] = float(r.get("confidence", 0.9))
+        r["model"]      = settings.ANTHROPIC_MODEL
+        if r["category"] not in ("LOAD", "DRIVER", "BILLING", "CLAIMS", "INSURANCE", "SAFETY", "AUDIT", "GENERAL"):
+            r["category"] = "GENERAL"
+        if r["priority"] not in ("HIGH", "MEDIUM", "LOW"):
+            r["priority"] = "MEDIUM"
         return r
     except Exception as e:
         logger.warning("classify error: %s", e)
-        return _fallback(subject)
+        return _fallback(subject, body, from_email)
 
 def generate_draft(from_email, subject, snippet, company_name, mc_number, instruction=""):
     if not settings.ANTHROPIC_API_KEY:
@@ -44,7 +99,10 @@ def generate_draft(from_email, subject, snippet, company_name, mc_number, instru
     prompt = f"Company: {company_name} ({mc_number})\nReply to: {from_email}\nSubject: {subject}\nContext: {snippet}\nInstruction: {instruction or 'Write a professional reply.'}\n\nWrite only the email body, no subject line."
     try:
         msg = _get_client().messages.create(
-            model=settings.ANTHROPIC_MODEL, max_tokens=600,
+            # Drafts use the bigger model — writing a reply needs more care than
+            # picking a category. Override via ANTHROPIC_DRAFT_MODEL env.
+            model=getattr(settings, "ANTHROPIC_DRAFT_MODEL", settings.ANTHROPIC_MODEL),
+            max_tokens=600,
             system="You are a professional freight dispatcher. Write concise professional email replies.",
             messages=[{"role":"user","content":prompt}]
         )

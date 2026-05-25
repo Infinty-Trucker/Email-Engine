@@ -36,6 +36,16 @@ class Conversation(models.Model):
     preview_sender   = models.EmailField(blank=True, default="")
     preview_subject  = models.CharField(max_length=500, blank=True, default="")
     preview_snippet  = models.TextField(blank=True, default="")
+    # Loose link to a TMS load (TMS owns the load record). Stored as opaque id
+    # to avoid a cross-service FK; indexed so "all email for load X" is a
+    # single range scan.
+    related_load_id  = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    # Per-thread opt-in for the AI follow-up monitor. When True and the last
+    # message was outbound + we've gone silent past the cooldown, the
+    # check_monitored_followups beat task drafts a follow-up and posts it to
+    # the company's Slack channel for human approval.
+    auto_monitor     = models.BooleanField(default=False, db_index=True)
+    last_followup_alert_at = models.DateTimeField(null=True, blank=True)
     created_at      = models.DateTimeField(auto_now_add=True)
     updated_at      = models.DateTimeField(auto_now=True)
 
@@ -77,6 +87,10 @@ class Message(models.Model):
     ai_draft         = models.TextField(blank=True)
     sent_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
                                 on_delete=models.SET_NULL, related_name="sent_messages")
+    # Groups outbound messages produced by a single load-channel post that
+    # fans out to N brokers (N threads, N Message rows). The channel UI
+    # collapses rows sharing this id into one entry. NULL on regular replies.
+    channel_post_id  = models.UUIDField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

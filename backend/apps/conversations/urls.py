@@ -3,7 +3,9 @@ from .views import ConversationViewSet
 
 router = DefaultRouter()
 router.register("", ConversationViewSet, basename="conversations")
-urlpatterns = router.urls
+# NOTE: explicit `path(...)` entries are prepended below so they win over the
+# router's `<pk>/` detail route. Without that, `/api/conversations/carriers/`
+# would be matched as a UUID pk lookup, never reaching `carriers_list`.
 
 from django.urls import path
 from rest_framework.decorators import api_view, permission_classes
@@ -250,7 +252,260 @@ def import_as_load(request, att_id):
     })
 
 
-urlpatterns += [
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def carriers_list(request):
+    """List the external email domains the tenant has corresponded with.
+
+    Used by the inbox sidebar to group threads by carrier/broker. Domains
+    come from the denormalized `preview_sender` column on Conversation
+    (always the external party — set from the first inbound message), so
+    this is a single GROUP BY on an indexed-friendly column.
+    """
+    from .models import Conversation
+    from apps.users.tms_auth import has_tms_permission
+    from django.db.models import Count, Max
+    from collections import defaultdict
+
+    user = request.user
+    if not has_tms_permission(user, "email.view"):
+        return Response({"error": "Missing required permission: email.view"}, status=403)
+
+    qs = Conversation.objects.all()
+
+    # Tenant scope — mirrors ConversationViewSet.get_queryset
+    tenant_mc = request.headers.get("X-Tenant") or request.query_params.get("mc")
+    if tenant_mc:
+        qs = qs.filter(mc_number=tenant_mc)
+    elif user.role not in ("admin", "manager"):
+        company_ids = list(user.assigned_companies.values_list("id", flat=True))
+        if company_ids:
+            qs = qs.filter(mailbox__company_id__in=company_ids)
+        else:
+            return Response({"results": []})
+
+    # Pull just the columns we need. Domain extraction is done in Python
+    # because Postgres' SUBSTRING(FROM POSITION) doesn't play nicely with
+    # the Django ORM and the per-tenant row count is bounded (<= 500-ish).
+    rows = qs.exclude(preview_sender="").values_list(
+        "preview_sender", "last_message_at", "preview_subject"
+    )
+
+    groups = defaultdict(lambda: {
+        "domain": "",
+        "count": 0,
+        "last_message_at": None,
+        "sample_sender": "",
+        "sample_subject": "",
+    })
+    for sender, last_at, subject in rows:
+        addr = (sender or "").lower().strip()
+        if "@" not in addr:
+            continue
+        domain = addr.rsplit("@", 1)[1]
+        if not domain:
+            continue
+        g = groups[domain]
+        g["domain"] = domain
+        g["count"] += 1
+        if last_at and (g["last_message_at"] is None or last_at > g["last_message_at"]):
+            g["last_message_at"] = last_at
+            g["sample_sender"] = sender
+            g["sample_subject"] = subject or ""
+
+    out = sorted(
+        groups.values(),
+        key=lambda g: g["last_message_at"] or 0,
+        reverse=True,
+    )
+    return Response({"results": out})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def carrier_messages(request):
+    """Flat chronological message feed for one carrier (sender domain).
+
+    Used by the Slack-style "carrier channel" view — a single timeline of every
+    message we've exchanged with anyone at `@<domain>`, across every thread.
+    Tenant-scoped via X-Tenant the same way the conversations list is.
+
+    Filtered by Message.sender_email's domain for inbound + Message
+    .recipient_email's domain for outbound, so outgoing replies appear in the
+    same channel even if the broker never wrote back.
+    """
+    from .models import Conversation, Message
+    from .serializers import AttachmentSerializer
+    from apps.users.tms_auth import has_tms_permission
+    from django.db.models import Q
+
+    user = request.user
+    if not has_tms_permission(user, "email.view"):
+        return Response({"error": "Missing required permission: email.view"}, status=403)
+
+    domain = (request.query_params.get("carrier") or "").strip().lstrip("@").lower()
+    load = (request.query_params.get("load") or "").strip()
+    if not domain and not load:
+        return Response({"error": "carrier or load query param required"}, status=400)
+    try:
+        limit = min(int(request.query_params.get("limit", 200)), 500)
+    except (TypeError, ValueError):
+        limit = 200
+
+    # Tenant scope mirrors ConversationViewSet — X-Tenant from the IDP wins,
+    # M2M assigned_companies is the standalone-DOS fallback.
+    tenant_mc = request.headers.get("X-Tenant") or request.query_params.get("mc")
+    conv_qs = Conversation.objects.all()
+    if tenant_mc:
+        conv_qs = conv_qs.filter(mc_number=tenant_mc)
+    elif user.role not in ("admin", "manager"):
+        company_ids = list(user.assigned_companies.values_list("id", flat=True))
+        if company_ids:
+            conv_qs = conv_qs.filter(mailbox__company_id__in=company_ids)
+        else:
+            return Response({"results": []})
+
+    # Apply the load filter on Conversation first — this scopes the message
+    # set to one channel ("every email tied to load #1234") and is what the
+    # LOAD CHANNELS view uses. Carriers slice by domain on Message side below.
+    if load:
+        conv_qs = conv_qs.filter(related_load_id=load)
+
+    msgs_qs = (
+        Message.objects
+        .filter(conversation__in=conv_qs)
+        .select_related("conversation")
+        .prefetch_related("attachments")
+    )
+    if domain:
+        # Match either inbound from the domain OR outbound to the domain so
+        # both sides of the exchange land in the channel. iendswith works on
+        # the full address ("@phoenix.com") so we don't catch
+        # phoenix.com.spammer.io.
+        needle = f"@{domain}"
+        msgs_qs = msgs_qs.filter(
+            Q(direction="inbound", sender_email__iendswith=needle) |
+            Q(direction="outbound", recipient_email__iendswith=needle)
+        )
+    msgs = msgs_qs.order_by("-created_at")[:limit]
+
+    out = []
+    for m in msgs:
+        conv = m.conversation
+        out.append({
+            "id": str(m.id),
+            "conversation_id": str(conv.id),
+            "conversation_subject": conv.preview_subject or m.subject or "",
+            "related_load_id": conv.related_load_id or "",
+            "direction": m.direction,
+            "sender_email": m.sender_email or "",
+            "recipient_email": m.recipient_email or "",
+            "cc": m.cc or "",
+            "subject": m.subject or "",
+            "snippet": m.snippet or "",
+            "body_text": (m.body_text or "")[:2000],
+            "channel_post_id": str(m.channel_post_id) if m.channel_post_id else None,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "attachments": AttachmentSerializer(m.attachments.all(), many=True).data,
+        })
+    # Reverse to oldest-first so the UI can append-render like a chat log.
+    out.reverse()
+    return Response({"count": len(out), "carrier": domain, "load": load, "results": out})
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def auto_monitor(request, conv_id):
+    """Toggle the per-thread auto-monitor flag.
+
+    POST enables; DELETE disables. When enabled, the
+    `check_monitored_followups` beat task watches the thread for outbound
+    silence and posts an AI-drafted follow-up to Slack for human approval.
+    """
+    from .models import Conversation
+    from apps.users.tms_auth import has_tms_permission
+
+    user = request.user
+    if not has_tms_permission(user, "email.view"):
+        return Response({"error": "Missing required permission: email.view"}, status=403)
+
+    try:
+        conv = Conversation.objects.select_related("mailbox__company").get(id=conv_id)
+    except Conversation.DoesNotExist:
+        return Response({"error": "Conversation not found"}, status=404)
+
+    tenant_mc = (request.headers.get("X-Tenant") or "").strip()
+    if tenant_mc and tenant_mc != (conv.mc_number or ""):
+        return Response({"error": "Forbidden for this tenant"}, status=403)
+
+    enabled = request.method == "POST"
+    update_fields = ["auto_monitor", "updated_at"]
+    conv.auto_monitor = enabled
+    # Clear the throttle on disable so a future re-enable starts fresh.
+    if not enabled:
+        conv.last_followup_alert_at = None
+        update_fields.append("last_followup_alert_at")
+    conv.save(update_fields=update_fields)
+    return Response({"ok": True, "auto_monitor": enabled})
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def link_load(request, conv_id):
+    """Attach (POST { load_id }) or detach (DELETE) a TMS load from a thread.
+
+    Stored as opaque string on Conversation.related_load_id — TMS owns the
+    load record. Inbox UI uses this to surface "this thread is for load #123"
+    and to drive the per-load conversation view.
+    """
+    from .models import Conversation
+    from apps.users.tms_auth import has_tms_permission
+
+    user = request.user
+    if not has_tms_permission(user, "email.view"):
+        return Response({"error": "Missing required permission: email.view"}, status=403)
+
+    try:
+        conv = Conversation.objects.select_related("mailbox__company").get(id=conv_id)
+    except Conversation.DoesNotExist:
+        return Response({"error": "Conversation not found"}, status=404)
+
+    # Tenant gate — same X-Tenant -> mc_number check used by the viewset.
+    tenant_mc = (request.headers.get("X-Tenant") or "").strip()
+    if tenant_mc and tenant_mc != (conv.mc_number or ""):
+        return Response({"error": "Forbidden for this tenant"}, status=403)
+
+    if request.method == "DELETE":
+        if conv.related_load_id:
+            conv.related_load_id = ""
+            conv.save(update_fields=["related_load_id", "updated_at"])
+        return Response({"ok": True, "related_load_id": ""})
+
+    load_id = str(request.data.get("load_id") or "").strip()
+    if not load_id:
+        return Response({"error": "load_id required"}, status=400)
+    if len(load_id) > 64:
+        return Response({"error": "load_id too long (max 64 chars)"}, status=400)
+
+    conv.related_load_id = load_id
+    conv.save(update_fields=["related_load_id", "updated_at"])
+    return Response({"ok": True, "related_load_id": load_id})
+
+
+from . import load_channels as _load_channels
+
+urlpatterns = [
     path("attachments/<uuid:att_id>/download/", attachment_download),
     path("attachments/<uuid:att_id>/import-as-load/", import_as_load),
-]
+    path("carriers/", carriers_list),
+    path("messages/", carrier_messages),
+    # Load-channel endpoints — Slack-style chat surface keyed on the
+    # TMS load id. Mounted under /api/conversations/ because that's the
+    # existing tenant-scoped namespace; the BFF wraps them as
+    # /api/email/load-channels/...
+    path("load-channels/", _load_channels.list_channels),
+    path("load-channels/<str:load_id>/", _load_channels.channel_detail),
+    path("load-channels/<str:load_id>/messages/", _load_channels.post_channel_message),
+    path("<uuid:conv_id>/link-load/", link_load),
+    path("<uuid:conv_id>/auto-monitor/", auto_monitor),
+] + router.urls

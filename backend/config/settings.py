@@ -97,6 +97,15 @@ CELERY_BEAT_SCHEDULE     = {
         "task": "notifications.check_stale_conversations",
         "schedule": 120.0,  # every 2 minutes
     },
+    # Per-thread auto-monitor — scans opted-in conversations for outbound
+    # silence and posts an AI-drafted follow-up to Slack for human approval.
+    # 5-min cadence: the silence/realert windows are measured in hours, so a
+    # tighter cadence just burns AI calls without changing user-visible
+    # latency.
+    "check-monitored-followups": {
+        "task": "notifications.check_monitored_followups",
+        "schedule": 300.0,
+    },
 }
 
 # CORS — wide-open for local dev; restricted to whitelisted domains in production.
@@ -136,7 +145,10 @@ SLACK_CHANNEL_COMPLIANCE     = env("SLACK_CHANNEL_COMPLIANCE",     default="")
 SLACK_CHANNEL_SYSTEM         = env("SLACK_CHANNEL_SYSTEM",         default="")
 
 ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
-ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+# Haiku 4.5 is plenty for category+priority JSON classification at ~5x lower
+# cost than Sonnet. Override via env if you need to A/B against a bigger model.
+ANTHROPIC_MODEL          = env("ANTHROPIC_MODEL",          default="claude-haiku-4-5-20251001")
+ANTHROPIC_DRAFT_MODEL    = env("ANTHROPIC_DRAFT_MODEL",    default="claude-sonnet-4-6")
 
 AWS_ACCESS_KEY_ID       = env("AWS_ACCESS_KEY_ID",       default="")
 AWS_SECRET_ACCESS_KEY   = env("AWS_SECRET_ACCESS_KEY",   default="")

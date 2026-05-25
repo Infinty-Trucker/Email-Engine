@@ -2,7 +2,7 @@ import re
 import shlex
 import uuid
 from datetime import date
-from django.db.models import F, OuterRef, Q, Subquery
+from django.db.models import Exists, F, OuterRef, Q, Subquery
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
@@ -222,6 +222,35 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
         company = self.request.query_params.get("company")
         if company:
             qs = qs.filter(mailbox__company_id=company)
+
+        # Folder filter — inbox / sent / drafts. A thread is in BOTH inbox and
+        # sent if it has messages in both directions (matches Gmail's mental
+        # model: replies cause a thread to show up in both folders).
+        folder = (self.request.query_params.get("folder") or "").lower()
+        if folder == "sent":
+            qs = qs.filter(
+                Exists(Message.objects.filter(conversation=OuterRef("pk"), direction="outbound"))
+            )
+        elif folder == "inbox":
+            qs = qs.filter(
+                Exists(Message.objects.filter(conversation=OuterRef("pk"), direction="inbound"))
+            )
+        # "all" (or any other value) skips the folder filter entirely.
+
+        # Carrier filter — group threads by the external sender's email domain.
+        # Uses the denormalized preview_sender (always the external party, set
+        # from the first inbound message) so we don't have to JOIN on Message
+        # to filter the list.
+        carrier = (self.request.query_params.get("carrier") or "").strip().lower()
+        if carrier:
+            # Allow callers to pass "@phoenixcapital.com" or "phoenixcapital.com"
+            domain = carrier.lstrip("@")
+            qs = qs.filter(preview_sender__iendswith=f"@{domain}")
+
+        # Load filter — show every email related to a specific TMS load.
+        related_load = (self.request.query_params.get("load") or "").strip()
+        if related_load:
+            qs = qs.filter(related_load_id=related_load)
 
         raw_q = self.request.query_params.get("q") or self.request.query_params.get("search")
         qs = _apply_search(qs, raw_q)

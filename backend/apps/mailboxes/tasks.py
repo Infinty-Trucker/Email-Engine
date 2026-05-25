@@ -63,6 +63,7 @@ def _parse_headers(msg):
         "subject":     h.get("subject", "") or "",
         "from":        h.get("from", ""),
         "to":          h.get("to", ""),
+        "cc":          h.get("cc", ""),
         "sent_at":     sent_at,
     }
 
@@ -299,12 +300,26 @@ def ingest_from_settings(self, settings_mailbox_id, gmail_message_id):
             Conversation.objects.filter(id=conv.id).update(mc_number=mc_number_cached)
             conv.mc_number = mc_number_cached
 
+        # Recipient = whoever the email was addressed To. For inbound that's
+        # us (the mailbox); for outbound we have to read the actual `To:`
+        # header — without this, every sent message rendered as "to:
+        # me@my-mailbox" and the UI showed no real recipient. EmailField
+        # rejects multi-recipient strings, so we keep the primary address
+        # in recipient_email and let the raw header (with names) live in
+        # `to_raw` if multiple. For v1 we just take the first address.
+        to_header = headers.get("to", "") or ""
+        cc_header = headers.get("cc", "") or ""
+        if direction == "outbound":
+            primary_to = _extract_email(to_header.split(",")[0]) if to_header else smb.email_address
+        else:
+            primary_to = smb.email_address
         msg = Message.objects.create(
             conversation=conv,
             direction=direction,
             gmail_message_id=msg_id,
             sender_email=from_email,
-            recipient_email=smb.email_address,
+            recipient_email=primary_to,
+            cc=cc_header,
             subject=headers["subject"],
             snippet=raw.get("snippet", ""),
             body_text=body_text or raw.get("snippet", ""),
@@ -354,6 +369,15 @@ def ingest_from_settings(self, settings_mailbox_id, gmail_message_id):
                               "ai_summary": result["summary"], "confidence": result["confidence"],
                               "model_version": result.get("model", "keyword")},
                 )
+                # Refine with the LLM in the background. Keyword above is the
+                # instant baseline; the worker overwrites this row with Haiku's
+                # answer when it lands. Skip obvious NOISE to avoid paying for
+                # a category we already know from filters.
+                if result.get("category") != "NOISE":
+                    try:
+                        classify_message.delay(str(msg.id))
+                    except Exception as cls_dispatch_err:
+                        logger.warning("AI classify dispatch failed: %s", cls_dispatch_err)
             except Exception as cls_err:
                 logger.warning("Inline classify failed: %s", cls_err)
 

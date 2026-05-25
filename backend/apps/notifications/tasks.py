@@ -880,3 +880,201 @@ def send_compliance_alert(message_id):
     flags  = "\n".join(f"• {f}" for f in scan.flags) if scan.flags else "None"
     text   = f"🚨 *Compliance Flag — {scan.risk_level} RISK* — {co.name}\nSent by: {sender}\nSubject: {msg.subject}\nFlags:\n{flags}\n{scan.recommendation}"
     post_to_slack(channel, text)
+
+
+# ── Auto-monitor follow-up ───────────────────────────────────────────────────
+# Per-thread `auto_monitor=True` opts a conversation into AI follow-up watching.
+# When the broker has gone silent past FOLLOWUP_SILENCE_HOURS since the
+# dispatcher's last outbound, the beat task drafts a follow-up via Haiku and
+# posts it to the company's loads-ops Slack channel for human approval.
+# Re-alerts are throttled by FOLLOWUP_REALERT_HOURS so we don't repost the
+# same draft every 2 min.
+
+FOLLOWUP_SILENCE_HOURS = 4
+FOLLOWUP_REALERT_HOURS = 24
+
+
+@shared_task(name="notifications.check_monitored_followups")
+def check_monitored_followups():
+    """Scan auto_monitor=True threads; alert on Slack when a follow-up is due.
+
+    Runs every few minutes via Celery Beat. The query is bounded by a single
+    Exists() against Message.direction and the (auto_monitor, last_message_at)
+    column pair — both indexed — so even a 50k-thread inbox stays cheap.
+    """
+    from apps.conversations.models import Conversation, Message
+    from django.db.models import Q
+    from datetime import timedelta
+    from django.utils import timezone as tz
+    from .ai_agent import decide_followup
+
+    now = tz.now()
+    silence_cutoff = now - timedelta(hours=FOLLOWUP_SILENCE_HOURS)
+    realert_cutoff = now - timedelta(hours=FOLLOWUP_REALERT_HOURS)
+
+    candidates = (
+        Conversation.objects
+        .filter(
+            auto_monitor=True,
+            status="open",
+            last_message_at__lte=silence_cutoff,
+        )
+        # last_followup_alert_at gates re-alerts. NULL means we've never
+        # alerted; older than realert_cutoff means the throttle window has
+        # passed.
+        .filter(
+            Q(last_followup_alert_at__isnull=True) |
+            Q(last_followup_alert_at__lt=realert_cutoff)
+        )
+        .select_related("mailbox__company", "assigned_dispatcher")
+    )
+
+    posted = 0
+    skipped_no_outbound = 0
+    skipped_no_followup = 0
+    skipped_no_channel = 0
+
+    for conv in candidates:
+        last_msg = (
+            Message.objects
+            .filter(conversation=conv)
+            .order_by("-created_at")
+            .first()
+        )
+        if not last_msg or last_msg.direction != "outbound":
+            # Inbound-tailed threads belong to check_stale_conversations.
+            skipped_no_outbound += 1
+            continue
+
+        decision = decide_followup(conv)
+        if not decision.get("needs_followup"):
+            skipped_no_followup += 1
+            # Stamp the throttle marker anyway so we don't re-ask the model
+            # every 2 min for a thread it just said "no" on. Re-asks happen
+            # naturally when a new message arrives (last_message_at advances
+            # past silence_cutoff again).
+            Conversation.objects.filter(id=conv.id).update(last_followup_alert_at=now)
+            continue
+
+        company = conv.mailbox.company
+        channel = (
+            company.slack_channel_loads_id
+            or company.slack_channel_loads_name
+            or company.slack_channel_id
+            or company.slack_channel
+        )
+        if not channel:
+            skipped_no_channel += 1
+            Conversation.objects.filter(id=conv.id).update(last_followup_alert_at=now)
+            continue
+
+        blocks = _build_followup_blocks(conv, last_msg, decision)
+        text = (
+            f"📬 Follow-up suggested for {conv.preview_subject or 'thread'} "
+            f"({company.name})"
+        )
+        if post_to_slack(channel, text=text, blocks=blocks):
+            posted += 1
+            Conversation.objects.filter(id=conv.id).update(last_followup_alert_at=now)
+        else:
+            logger.warning(
+                "Slack post failed for monitored conv %s (channel=%s)",
+                conv.id, channel,
+            )
+
+    logger.info(
+        "check_monitored_followups: posted=%d no_outbound=%d no_followup=%d no_channel=%d",
+        posted, skipped_no_outbound, skipped_no_followup, skipped_no_channel,
+    )
+    return {
+        "posted": posted,
+        "skipped_no_outbound": skipped_no_outbound,
+        "skipped_no_followup": skipped_no_followup,
+        "skipped_no_channel": skipped_no_channel,
+    }
+
+
+def _build_followup_blocks(conv, last_msg, decision):
+    """Compose the Slack Block Kit payload for an auto-monitor alert.
+
+    The dispatcher reads the suggested draft right in Slack, then clicks
+    "Open thread" to land on the inbox UI where Edit + Send already exist —
+    no interactive Slack components needed for v1 approval.
+    """
+    from django.utils import timezone as tz
+    company = conv.mailbox.company
+    silent_hours = max(1, int((tz.now() - last_msg.created_at).total_seconds() / 3600))
+    broker = (last_msg.recipient_email or "—").split("@", 1)[0]
+
+    dispatcher_name = "unassigned"
+    if conv.assigned_dispatcher:
+        dispatcher_name = (
+            conv.assigned_dispatcher.get_full_name()
+            or conv.assigned_dispatcher.email
+            or "dispatcher"
+        )
+
+    frontend = getattr(settings, "FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    thread_url = f"{frontend}/email?conversation={conv.id}"
+
+    confidence_pct = int((decision.get("confidence") or 0) * 100)
+    load_line = f"Linked load: *{conv.related_load_id}*" if conv.related_load_id else "No linked load"
+
+    return [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "📬 Auto-monitor: follow-up suggested",
+                "emoji": True,
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Company*\n{company.name} (MC {company.mc_number})"},
+                {"type": "mrkdwn", "text": f"*Broker*\n{broker}"},
+                {"type": "mrkdwn", "text": f"*Silent for*\n{silent_hours}h"},
+                {"type": "mrkdwn", "text": f"*Dispatcher*\n{dispatcher_name}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Thread:* {conv.preview_subject or '(no subject)'}\n{load_line}",
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*AI-suggested follow-up* — confidence {confidence_pct}%\n"
+                    f"_{decision.get('reason', '')}_"
+                ),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f">*{decision.get('draft_subject', '')}*\n"
+                    f">{decision.get('draft_body', '').replace(chr(10), chr(10) + '>')}"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Open thread", "emoji": True},
+                    "url": thread_url,
+                    "style": "primary",
+                },
+            ],
+        },
+    ]

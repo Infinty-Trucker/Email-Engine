@@ -153,6 +153,134 @@ Decide whether to auto-reply. Respond with JSON only."""
                 "category": "other", "confidence": 0.0, "reply_body": "", "reply_subject": ""}
 
 
+FOLLOWUP_SYSTEM_PROMPT = """You decide whether a freight dispatcher should send a
+follow-up to a broker who has gone silent after the dispatcher's last email.
+
+Output VALID MINIFIED JSON ONLY — no prose, no markdown fences:
+{"needs_followup": true, "reason": "...", "confidence": 0.9, "draft_subject": "...", "draft_body": "..."}
+
+Decide NEEDS_FOLLOWUP = true when:
+- The dispatcher asked the broker a question and the broker hasn't answered
+- The dispatcher is waiting on a confirmation, document, payment, or booking
+- The thread is about an active load and silence risks the dispatch
+
+Decide NEEDS_FOLLOWUP = false when:
+- The dispatcher's last message closed the loop ("thanks", "confirmed", "noted")
+- The broker may legitimately need more time (e.g. dispatcher just asked for a complex quote)
+- The thread is informational with no pending action
+- The dispatcher's last message was already a follow-up (we've nudged enough)
+- Anything ambiguous — when in doubt, false
+
+Draft rules (when needs_followup is true):
+- One short paragraph, professional, no greeting fluff
+- Reference the original ask in one sentence ("Following up on the rate request for…")
+- Ask for the same thing again, give them an easy out ("If timing changed, let us know")
+- Keep under 60 words
+- Subject = "Re: <original subject>" or "Follow-up: <topic>"
+- Never invent facts not in the thread
+
+Confidence rules:
+- >= 0.85 when both signals (silence + actionable open question) are clear
+- 0.6-0.85 when one signal is fuzzy
+- < 0.6 — return needs_followup=false instead
+"""
+
+
+def decide_followup(conversation):
+    """Decide whether a stale outbound thread needs a follow-up + draft one.
+
+    Used by the per-thread auto-monitor beat task. Different shape from
+    `decide_and_draft` (which handles the inverse: broker→us silence). Returns
+    a dict the beat task can post to Slack for human approval.
+
+    Failure modes return needs_followup=False so the beat task simply skips
+    the thread (no false positives, no Slack spam).
+    """
+    fail_default = {
+        "needs_followup": False,
+        "reason": "",
+        "confidence": 0.0,
+        "draft_subject": "",
+        "draft_body": "",
+        "model": "",
+    }
+
+    if not settings.ANTHROPIC_API_KEY:
+        return {**fail_default, "reason": "AI disabled (no API key)"}
+    if _ai_is_in_cooldown():
+        return {**fail_default, "reason": "AI in cooldown"}
+
+    msgs = list(conversation.messages.order_by("created_at"))
+    if not msgs:
+        return {**fail_default, "reason": "no messages"}
+    last_msg = msgs[-1]
+    if last_msg.direction != "outbound":
+        # Caller should have filtered; bail safely if not.
+        return {**fail_default, "reason": "last message is not outbound"}
+
+    # Compact transcript — keep token cost predictable. We only need enough
+    # context for the model to judge "did the broker actually answer?" so the
+    # last 8 messages capped at 500 chars each is plenty.
+    transcript = []
+    for m in msgs[-8:]:
+        role = "DISPATCHER" if m.direction == "outbound" else "BROKER"
+        body = (m.body_text or m.snippet or "")[:500]
+        transcript.append(f"[{role}] {m.sender_email}\nSubject: {m.subject}\n{body}")
+
+    from django.utils import timezone as tz
+    silent_hours = max(0, int((tz.now() - last_msg.created_at).total_seconds() / 3600))
+
+    user_prompt = (
+        f"Carrier company: {conversation.mailbox.company.name} "
+        f"(MC {conversation.mailbox.company.mc_number})\n"
+        f"Dispatcher mailbox: {conversation.mailbox.email_address}\n"
+        f"Broker has been silent for {silent_hours}h since the dispatcher's last reply.\n\n"
+        f"THREAD (oldest → newest):\n" + "\n---\n".join(transcript)
+    )
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=400,
+            system=[{
+                "type": "text",
+                "text": FOLLOWUP_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+
+        needs = bool(result.get("needs_followup"))
+        confidence = float(result.get("confidence", 0.0))
+        if needs and confidence < 0.6:
+            # Self-policed threshold matches what the prompt instructs the
+            # model to do — belt-and-suspenders for a confused response.
+            needs = False
+            result["reason"] = f"Confidence {confidence:.2f} below 0.6 threshold"
+
+        return {
+            "needs_followup": needs,
+            "reason": str(result.get("reason", ""))[:500],
+            "confidence": confidence,
+            "draft_subject": (str(result.get("draft_subject", "")) or f"Re: {last_msg.subject}")[:300] if needs else "",
+            "draft_body": str(result.get("draft_body", ""))[:2000] if needs else "",
+            "model": settings.ANTHROPIC_MODEL,
+        }
+    except Exception as e:
+        err_str = str(e)
+        if any(s in err_str for s in (
+            "credit balance is too low", "insufficient_quota",
+            "rate_limit", "rate limit", "billing", "quota",
+        )):
+            _trigger_ai_cooldown(err_str[:200])
+        logger.warning("decide_followup failed for conv %s: %s", conversation.id, e)
+        return {**fail_default, "reason": f"AI error: {e}"}
+
+
 def execute_auto_reply(conversation, decision, user=None):
     """
     Create an outbound Message for the AI's reply and queue it for sending via Gmail.
