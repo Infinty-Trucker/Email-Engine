@@ -269,6 +269,51 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs[:limit]
         return qs
 
+    @action(detail=False, methods=["get"])
+    def counts(self, request):
+        """Per-folder counts for the sidebar — tenant-scoped, filter-free.
+
+        The visible inbox list is folder/search/carrier-filtered, but the
+        sidebar badges need to reflect the whole mailbox so users can see
+        at a glance what's available even when they've narrowed the view.
+        Five separate aggregates over the same scoped queryset; each
+        Exists subquery short-circuits per row so the cost stays bounded.
+        """
+        from apps.users.tms_auth import has_tms_permission
+        user = request.user
+        empty = {"all": 0, "inbox": 0, "sent": 0, "starred": 0, "unread": 0}
+        if not has_tms_permission(user, "email.view"):
+            return Response(empty)
+
+        qs = Conversation.objects.all()
+
+        # Tenant scoping — mirrors get_queryset() so the counts can't leak
+        # across MCs even if the underlying scope rules drift.
+        tenant_mc = (
+            request.headers.get("X-Tenant")
+            or request.query_params.get("mc")
+        )
+        if tenant_mc:
+            qs = qs.filter(mc_number=tenant_mc)
+        elif user.role not in ("admin", "manager"):
+            company_ids = user.assigned_companies.values_list("id", flat=True)
+            if company_ids:
+                qs = qs.filter(mailbox__company_id__in=company_ids)
+
+        if user.visible_categories and user.role not in ("admin", "manager"):
+            qs = qs.filter(category__in=user.visible_categories + [""])
+
+        msg_for_conv = Message.objects.filter(conversation=OuterRef("pk"))
+        return Response({
+            "all": qs.count(),
+            "inbox": qs.filter(Exists(msg_for_conv.filter(direction="inbound"))).count(),
+            "sent": qs.filter(Exists(msg_for_conv.filter(direction="outbound"))).count(),
+            "starred": qs.filter(is_starred=True).count(),
+            "unread": qs.filter(
+                Q(read_at__isnull=True) | Q(last_message_at__gt=F("read_at"))
+            ).count(),
+        })
+
     @action(detail=True, methods=["post"])
     def reply(self, request, pk=None):
         from apps.users.tms_auth import has_tms_permission
