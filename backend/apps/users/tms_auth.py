@@ -42,7 +42,7 @@ def has_tms_permission(user, slug: str) -> bool:
     Returns True for case 1 and 2; case 3 is signalled by a None return so
     callers can distinguish "no slug data" from "explicit deny".
     """
-    if getattr(user, "_tms_is_superuser", False):
+    if getattr(user, "is_superuser", False) or getattr(user, "_tms_is_superuser", False):
         return True
     slugs = getattr(user, "_tms_permissions", None)
     if not slugs:

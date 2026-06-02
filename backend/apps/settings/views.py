@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 def require_admin(request):
+    # Superusers bypass the role gate entirely (full cross-tenant admin access).
+    if getattr(request.user, "is_superuser", False):
+        return None
     if request.user.role not in ("admin", "manager"):
         return Response({"error": "Admin or manager role required"}, status=403)
 

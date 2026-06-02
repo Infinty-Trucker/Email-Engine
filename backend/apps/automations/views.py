@@ -34,7 +34,7 @@ class MailRuleListCreateView(APIView):
     def get(self, request):
         mcs = _user_mc_numbers(request.user)
         qs = MailRule.objects.select_related("company").all()
-        if not request.user.is_staff:
+        if not (request.user.is_staff or request.user.is_superuser):
             qs = qs.filter(company__mc_number__in=mcs)
         data = MailRuleSerializer(qs, many=True).data
         return Response(data)
@@ -43,7 +43,7 @@ class MailRuleListCreateView(APIView):
         serializer = MailRuleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         # Ensure non-staff callers can only create rules for their tenants.
-        if not request.user.is_staff:
+        if not (request.user.is_staff or request.user.is_superuser):
             company = serializer.validated_data.get("company")
             mcs = _user_mc_numbers(request.user)
             if company is None or company.mc_number not in mcs:
@@ -63,7 +63,7 @@ class MailRuleDetailView(APIView):
             rule = MailRule.objects.select_related("company").get(id=rule_id)
         except MailRule.DoesNotExist:
             return None
-        if not request.user.is_staff:
+        if not (request.user.is_staff or request.user.is_superuser):
             mcs = _user_mc_numbers(request.user)
             if rule.company_id is None or rule.company.mc_number not in mcs:
                 return None
@@ -101,7 +101,7 @@ class MailRuleExecutionListView(APIView):
             MailRuleExecution.objects.select_related("rule", "rule__company", "message")
             .order_by("-attempted_at")[:200]
         )
-        if not request.user.is_staff:
+        if not (request.user.is_staff or request.user.is_superuser):
             qs = qs.filter(rule__company__mc_number__in=mcs)
         data = MailRuleExecutionSerializer(qs, many=True).data
         return Response(data)
