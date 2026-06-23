@@ -266,14 +266,19 @@ def send_inbound_alert(message_id):
     if not company.slack_alerts_enabled:
         return
     cat     = conv.category or "GENERAL"
-    if cat not in ("SAFETY", "AUDIT"):
+    pri     = conv.priority or ""
+    # SAFETY always pages; COMPLIANCE only when HIGH (audits/OOS/Clearinghouse)
+    # so routine IFTA/permit/registration renewals don't trigger urgent alerts.
+    # AUDIT kept as a legacy alias for COMPLIANCE during the rename rollout.
+    is_urgent = cat == "SAFETY" or (cat in ("COMPLIANCE", "AUDIT") and pri == "HIGH")
+    if not is_urgent:
         return
-    # Route SAFETY/AUDIT urgent alerts to the company's paperwork-ops channel
+    # Route urgent safety/compliance alerts to the company's paperwork-ops channel
     channel = company.slack_channel_paperwork_id or company.slack_channel_paperwork_name
     if not channel:
         return
     link = f"{settings.FRONTEND_URL}/?conversation={conv.id}"
-    icons = {"SAFETY":"🛡️","AUDIT":"📋"}
+    icons = {"SAFETY":"🛡️","COMPLIANCE":"📋","AUDIT":"📋"}
     text = (
         f"{icons.get(cat,'⚠️')} *URGENT {cat}* — {company.name} ({company.mc_number})\n"
         f"*{msg.subject}*\n"
@@ -303,8 +308,8 @@ def send_approval_request(approval_id):
     post_to_slack(channel, text)
 
 
-LOAD_CATS  = ("LOAD", "DRIVER")
-PAPER_CATS = ("BILLING", "CLAIMS", "INSURANCE", "SAFETY", "AUDIT")
+LOAD_CATS  = ("LOAD", "TRACKING", "DRIVER")
+PAPER_CATS = ("BILLING", "CLAIMS", "INSURANCE", "SAFETY", "COMPLIANCE", "AUDIT")
 ALL_IMPORTANT = LOAD_CATS + PAPER_CATS + ("GENERAL",)
 
 
@@ -354,8 +359,8 @@ def _classify_urgency(category, subject, body, from_email):
     """
     s = (subject + " " + (body or "")[:800]).lower()
 
-    # Safety/audit always urgent
-    if category in ("SAFETY", "AUDIT", "CLAIMS"):
+    # Safety/compliance/claims always urgent (legacy AUDIT alias included)
+    if category in ("SAFETY", "COMPLIANCE", "AUDIT", "CLAIMS"):
         return "urgent", f"{category} issue — always urgent"
 
     # New load offers are routine (not yet committed)

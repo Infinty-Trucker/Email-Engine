@@ -266,7 +266,14 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
                 limit = min(int(self.request.query_params.get("limit", 200)), 500)
             except (TypeError, ValueError):
                 limit = 200
-            qs = qs[:limit]
+            try:
+                offset = max(int(self.request.query_params.get("offset", 0)), 0)
+            except (TypeError, ValueError):
+                offset = 0
+            # Window the queryset so the frontend can page past the per-request
+            # cap (limit defaults to 200, hard-max 500) instead of silently
+            # only ever seeing the 200 most-recent threads.
+            qs = qs[offset:offset + limit]
         return qs
 
     @action(detail=False, methods=["get"])
@@ -328,7 +335,7 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
 
         category = conv.category or ""
         needs_approval = (
-            category in ("SAFETY", "AUDIT", "CLAIMS")
+            category in ("SAFETY", "COMPLIANCE", "AUDIT", "CLAIMS")
             and not request.user.can_approve
         )
 

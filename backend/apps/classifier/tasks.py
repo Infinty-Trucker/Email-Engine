@@ -45,7 +45,7 @@ def classify_message(self, message_id):
     conv.category = result["category"]
     conv.priority = result["priority"]
     conv.save(update_fields=["category","priority","updated_at"])
-    if result["priority"] == "HIGH" or result["category"] in ("SAFETY","AUDIT"):
+    if result["priority"] == "HIGH" or result["category"] in ("SAFETY","COMPLIANCE","AUDIT"):
         try:
             from apps.notifications.tasks import send_inbound_alert
             send_inbound_alert.delay(str(msg.id))

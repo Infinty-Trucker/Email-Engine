@@ -52,22 +52,24 @@ const T = {
 };
 
 const ROLE_META = {
-  dispatcher: { color: "#38bdf8", icon: "🚛", label: "Dispatcher", cats: ["LOAD","DRIVER","GENERAL"], canApprove: false, isAdmin: false },
+  dispatcher: { color: "#38bdf8", icon: "🚛", label: "Dispatcher", cats: ["LOAD","TRACKING","DRIVER","GENERAL"], canApprove: false, isAdmin: false },
   accountant:  { color: "#34d399", icon: "💳", label: "Accountant", cats: ["BILLING","CLAIMS","INSURANCE","GENERAL"], canApprove: false, isAdmin: false },
-  safety:      { color: "#fb923c", icon: "🛡️", label: "Safety Officer", cats: ["SAFETY","AUDIT","GENERAL"], canApprove: true, isAdmin: false },
-  manager:     { color: "#a78bfa", icon: "⚙️", label: "Manager", cats: ["LOAD","DRIVER","BILLING","CLAIMS","INSURANCE","SAFETY","AUDIT","GENERAL"], canApprove: true, isAdmin: false },
-  admin:       { color: "#f472b6", icon: "🔧", label: "System Admin", cats: ["LOAD","DRIVER","BILLING","CLAIMS","INSURANCE","SAFETY","AUDIT","GENERAL"], canApprove: true, isAdmin: true },
+  safety:      { color: "#fb923c", icon: "🛡️", label: "Safety & Compliance", cats: ["SAFETY","COMPLIANCE","INSURANCE","GENERAL"], canApprove: true, isAdmin: false },
+  manager:     { color: "#a78bfa", icon: "⚙️", label: "Manager", cats: ["LOAD","TRACKING","DRIVER","BILLING","CLAIMS","INSURANCE","SAFETY","COMPLIANCE","GENERAL"], canApprove: true, isAdmin: false },
+  admin:       { color: "#f472b6", icon: "🔧", label: "System Admin", cats: ["LOAD","TRACKING","DRIVER","BILLING","CLAIMS","INSURANCE","SAFETY","COMPLIANCE","GENERAL"], canApprove: true, isAdmin: true },
 };
 
 const CAT_META = {
-  LOAD:      { icon: "🚛", color: "#f97316", label: "Loads" },
-  DRIVER:    { icon: "👤", color: "#38bdf8", label: "Drivers" },
-  BILLING:   { icon: "💳", color: "#34d399", label: "Billing" },
-  CLAIMS:    { icon: "⚠️", color: "#fb7185", label: "Claims" },
-  INSURANCE: { icon: "📄", color: "#818cf8", label: "Insurance" },
-  SAFETY:    { icon: "🛡️", color: "#fb923c", label: "Safety" },
-  AUDIT:     { icon: "📋", color: "#fbbf24", label: "Audit" },
-  GENERAL:   { icon: "📧", color: "#94a3b8", label: "General" },
+  LOAD:       { icon: "🚛", color: "#f97316", label: "Loads" },
+  TRACKING:   { icon: "📍", color: "#22d3ee", label: "Tracking" },
+  DRIVER:     { icon: "👤", color: "#38bdf8", label: "Drivers" },
+  BILLING:    { icon: "💳", color: "#34d399", label: "Billing" },
+  CLAIMS:     { icon: "⚠️", color: "#fb7185", label: "Claims" },
+  INSURANCE:  { icon: "📄", color: "#818cf8", label: "Insurance" },
+  SAFETY:     { icon: "🛡️", color: "#fb923c", label: "Safety" },
+  COMPLIANCE: { icon: "📋", color: "#fbbf24", label: "Compliance" },
+  AUDIT:      { icon: "📋", color: "#fbbf24", label: "Compliance" }, // legacy alias → COMPLIANCE
+  GENERAL:    { icon: "📧", color: "#94a3b8", label: "General" },
 };
 
 // ─── MESSAGE BODY HELPERS ────────────────────────────────────────────────────
@@ -497,15 +499,27 @@ function DispatchOSApp() {
     if (!user) return;
     setEmailsLoading(true);
     try {
-      // Limit to recent 200 conversations — full list crashes the browser
-      const r = await fetch("/api/conversations/?limit=200", { credentials: "include" });
-      if (!r.ok) {
-        console.error("Conversations API error:", r.status, r.statusText);
-        setEmailsLoading(false);
-        return;
+      // Page through the inbox so the user sees ALL imported threads, not just
+      // the 200 most recent. The list endpoint caps each response at 200
+      // (hard-max 500), so we walk offsets until a short page arrives, bounded
+      // by a safety cap so a very large mailbox can't lock up the browser.
+      const PAGE = 200, MAX_THREADS = 2000;
+      let convs = [];
+      for (let offset = 0; offset < MAX_THREADS; offset += PAGE) {
+        const r = await fetch(`/api/conversations/?limit=${PAGE}&offset=${offset}`, { credentials: "include" });
+        if (!r.ok) {
+          if (offset === 0) {
+            console.error("Conversations API error:", r.status, r.statusText);
+            setEmailsLoading(false);
+            return;
+          }
+          break; // network blip mid-walk — keep whatever already loaded
+        }
+        const data = await r.json();
+        const page = Array.isArray(data) ? data : (data.results || []);
+        convs = convs.concat(page);
+        if (page.length < PAGE) break; // reached the last page
       }
-      const data = await r.json();
-      const convs = Array.isArray(data) ? data : (data.results || []);
       // Map Django conversation shape → UI email shape
       const mapped = convs.map(c => {
         const lastMsg = c.messages?.filter(m => m.direction === "inbound").slice(-1)[0];
@@ -514,11 +528,14 @@ function DispatchOSApp() {
           id:          c.id,
           companyId:   String(c.company_id || ''),
           mailboxId:   c.mailbox_email,
-          from:        lastMsg?.sender_email || "",
-          subject:     lastMsg?.subject || c.messages?.[0]?.subject || "(no subject)",
-          body:        lastMsg?.body_text || lastMsg?.snippet || "",
+          // The list endpoint serves denormalized preview_* columns and omits
+          // the message chain; prefer those and fall back to messages[] for the
+          // detail/append paths that DO include the full thread.
+          from:        c.preview_sender || lastMsg?.sender_email || "",
+          subject:     c.preview_subject || lastMsg?.subject || c.messages?.[0]?.subject || "(no subject)",
+          body:        lastMsg?.body_text || lastMsg?.snippet || c.preview_snippet || "",
           body_html:   lastMsg?.body_html || "",
-          snippet:     lastMsg?.snippet || "",
+          snippet:     c.preview_snippet || lastMsg?.snippet || "",
           time: (() => {
             if (!c.last_message_at) return "";
             const d = new Date(c.last_message_at);
@@ -1605,7 +1622,7 @@ function OperatorUI({ currentUser, companies, mailboxes, emails, setEmails, emai
                 </div>
               )}
             </div>
-            {["SAFETY","AUDIT","CLAIMS"].includes(selectedEmail.category) && !role.canApprove && (
+            {["SAFETY","COMPLIANCE","AUDIT","CLAIMS"].includes(selectedEmail.category) && !role.canApprove && (
               <div style={{ background: T.yellowDim, border: `1px solid ${T.yellow}33`, borderRadius: 3, padding: "7px 11px", fontSize: 9, color: T.yellow, marginBottom: 10 }}>
                 ⚠ {selectedEmail.category} emails require manager approval before sending.
               </div>
@@ -1616,7 +1633,7 @@ function OperatorUI({ currentUser, companies, mailboxes, emails, setEmails, emai
           </div>
           <div style={{ padding: "10px 16px", borderTop: `1px solid ${T.border}`, display: "flex", gap: 7 }}>
             <Btn variant="primary" onClick={handleSend} disabled={!draft.trim() || sending}>
-              {sending ? "SENDING…" : ["SAFETY","AUDIT","CLAIMS"].includes(selectedEmail.category) && !role.canApprove ? "↗ SUBMIT FOR APPROVAL" : "↗ SEND VIA GMAIL"}
+              {sending ? "SENDING…" : ["SAFETY","COMPLIANCE","AUDIT","CLAIMS"].includes(selectedEmail.category) && !role.canApprove ? "↗ SUBMIT FOR APPROVAL" : "↗ SEND VIA GMAIL"}
             </Btn>
             <Btn onClick={() => { setReplyOpen(false); setDraft(""); setInstruction(""); setReplyCC(""); setReplyFiles([]); }}>CANCEL</Btn>
           </div>

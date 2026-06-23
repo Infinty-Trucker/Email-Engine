@@ -15,12 +15,15 @@ class User(AbstractUser):
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.DISPATCHER)
     assigned_companies = models.ManyToManyField("companies.Company", blank=True, related_name="assigned_users")
 
+    # Which categories each role sees in their inbox. Categories map to the
+    # carrier back-office function that owns them; INSURANCE is shared between
+    # Accounting (COI billing) and Safety & Compliance (coverage/audits).
     ROLE_CATEGORIES = {
-        "dispatcher": ["LOAD", "DRIVER", "GENERAL"],
+        "dispatcher": ["LOAD", "TRACKING", "DRIVER", "GENERAL"],
         "accountant":  ["BILLING", "CLAIMS", "INSURANCE", "GENERAL"],
-        "safety":      ["SAFETY", "AUDIT", "GENERAL"],
-        "manager":     ["LOAD", "DRIVER", "BILLING", "CLAIMS", "INSURANCE", "SAFETY", "AUDIT", "GENERAL"],
-        "admin":       ["LOAD", "DRIVER", "BILLING", "CLAIMS", "INSURANCE", "SAFETY", "AUDIT", "GENERAL"],
+        "safety":      ["SAFETY", "COMPLIANCE", "INSURANCE", "GENERAL"],
+        "manager":     ["LOAD", "TRACKING", "DRIVER", "BILLING", "CLAIMS", "INSURANCE", "SAFETY", "COMPLIANCE", "GENERAL"],
+        "admin":       ["LOAD", "TRACKING", "DRIVER", "BILLING", "CLAIMS", "INSURANCE", "SAFETY", "COMPLIANCE", "GENERAL"],
     }
 
     def save(self, *args, **kwargs):
